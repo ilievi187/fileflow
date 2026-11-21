@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=FileFlow
+Comment=Sort a messy folder into categorized, sharded folders (library + CLI + tkinter GUI)
+Exec=python3 /home/iliev/fileflow/file_organizer_gui.py
+Icon=/home/iliev/fileflow/icons/fileflow.svg
+Terminal=false
+Type=Application
+Categories=Utility;FileTools;
