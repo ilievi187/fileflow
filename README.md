@@ -1,33 +1,34 @@
 # FileFlow
 
-Sort a messy folder into clean, categorized folders — a small **library + CLI + Qt GUI**
-for tidying downloads, screenshots, scans and dumps.
+Sort a messy folder into clean, categorized folders — **library + CLI + Qt GUI**.
+Drop a folder on the window, press Start, watch it sort. Everything stays local.
 
 ![FileFlow](docs/screenshot.png)
-
-Drop a folder on the window, press Start, watch it sort. Nothing leaves your
-machine.
 
 ## What it does
 
 - **Categorises** by extension and name hints: Documents, Images, Videos, Audio,
   Archives, Code, Data, Fonts, Executables, Logs, Other.
-- **Projects** — pull out your own projects by name or regex into `Projects/<name>/`.
+- **Projects** — pull your own projects out by name or regex into `Projects/<name>/`.
 - **Sharding** — split big categories into `A/`, `B/`, `C/` so no folder ends up
   with a million files.
-- **Keeps the tree** optionally, so `sub/deep/file.pdf` stays under
-  `Documents/sub/deep/`.
-- **Copy or move**, **dry-run**, minimum file size, configurable workers.
+- **Keep subfolders** — `sub/deep/file.pdf` stays under `Documents/sub/deep/`.
+- **Group by date** — `Documents/2025/06/report.pdf`.
+- **Duplicates** — hash-compare and move extra copies to `Duplicates/`
+  (or only report them).
+- **Exclude globs** — skip `*.tmp`, `node_modules`, `.git`, whatever you like.
+- **Prune empty folders** left behind after a run.
 
-## Guarantees (all covered by tests)
+## Safety
 
 | Guarantee | Why it matters |
 |---|---|
-| **Nothing is overwritten** | destinations are allocated under a lock; a collision becomes `name_ab12cd34.pdf`, never a silent replace |
-| **Running twice is safe** | a file already at its computed destination counts as "already sorted" and is left alone — no digest suffixes piling up |
-| **Stop actually stops** | `stop_event` is checked before queueing and inside every task; in-flight tasks are still counted so the numbers match the disk |
-| **No shell** | nothing is ever passed through a shell |
-| **Your output isn't re-scanned** | if `--dest` is inside the source, that subtree is skipped |
+| **Nothing is overwritten** | destinations are allocated under a lock; a collision becomes `name_ab12cd34.pdf` |
+| **Second run is a no-op** | files already at their destination count as "already sorted" |
+| **Stop really stops** | checked before queueing and inside every task; in-flight work is still counted so stats match the disk |
+| **Undo** | every run writes a journal; one button puts everything back (and removes copies), never overwriting newer files |
+| **No shell** | argv only, nothing is passed through a shell |
+| **Own output is not re-scanned** | a destination inside the source is skipped |
 
 ## Install
 
@@ -45,12 +46,18 @@ cd fileflow
 ./run.sh            # or: python3 fileflow_qt.py
 ```
 
-- drop a folder anywhere on the window (or click the box)
-- destination is optional — empty means sort in place
-- live progress bar, counters for moved / copied / already sorted / failed
-- Stop button, `Ctrl+Enter` to start, `Esc` to stop
+- drag a folder anywhere on the window, or click the box
+- destination optional — empty means sort in place
+- live progress bar and counters: moved / copied / already sorted / duplicates / failed
+- **Undo last run** restores the previous run from its journal
+- Stop, `Ctrl+Enter` to start, `Esc` to stop
 - "open destination" when it finishes
-- `fileflow.desktop` + `icons/fileflow.svg` for your app launcher
+- **follows the desktop theme** (Omarchy): colours reload live when you switch
+  themes, everything else stays put
+- quiet motion: faded page load, smooth progress and counters, gentle glow while
+  a run is active
+
+`fileflow.desktop` + `icons/fileflow.svg` are included for the app launcher.
 
 ## CLI
 
@@ -58,15 +65,16 @@ cd fileflow
 # preview only
 python3 file_organizer.py ~/Downloads --dry-run
 
-# sort into a separate tree, pull out two projects
+# sort into a separate tree, pull out projects, skip junk
 python3 file_organizer.py ~/messy --dest ~/sorted \
-    --projects siteA,projectX --project-regex 'report_|_backup' --max-workers 8
+    --projects siteA,projectX --exclude '*.tmp,node_modules,.git'
 
-# copy instead of move, keep subfolders
-python3 file_organizer.py ~/messy --copy --keep-tree
+# move duplicate copies aside, group by date, prune empty folders
+python3 file_organizer.py ~/messy --dest ~/sorted \
+    --duplicates move --by-date --prune-empty
 
-# per-file JSONL log + stats JSON
-python3 file_organizer.py ~/messy --log run.jsonl --json-out stats.json
+# undo the last run
+python3 file_organizer.py --undo
 ```
 
 | Flag | Meaning |
@@ -76,33 +84,41 @@ python3 file_organizer.py ~/messy --log run.jsonl --json-out stats.json
 | `--dry-run` | plan only |
 | `--no-shard` | one folder per category |
 | `--keep-tree` | keep source subfolders inside each category |
+| `--by-date` | group inside each category by `YYYY/MM` |
+| `--prune-empty` | remove folders left empty |
 | `--projects a,b` | project names to pull into `Projects/` |
 | `--project-regex RE` | regex alternative |
+| `--exclude GLOBS` | comma-separated globs to ignore |
+| `--duplicates keep\|move\|report` | what to do with identical files |
 | `--min-size-bytes N` | skip small files |
 | `--max-workers N` | worker threads (default 8) |
-| `--log FILE` | JSONL per-file log (`src`, `dst`, `action`) |
+| `--journal PATH` | where to record the run (default: user state dir) |
+| `--no-journal` | no journal — disables undo |
+| `--undo` | reverse the recorded run |
+| `--log FILE` | JSONL per-file log |
 | `--json-out FILE` | stats JSON |
 
 ## Library
 
 ```python
-from file_organizer import organize
+from file_organizer import organize, undo
 
 stats = organize(
     "~/messy",
     dest="~/sorted",
-    copy=False,
-    projects=None,
-    project_names="siteA",
-    keep_tree=False,
-    on_event=print,               # progress text
-    on_progress=lambda done, total: ...,  # progress bar
+    exclude="*.tmp,node_modules",
+    duplicates="move",
+    by_date=True,
+    prune_empty=True,
+    on_event=print,                        # progress text
+    on_progress=lambda done, total: ...,   # progress bar
 )
-print(stats["moved"], stats["failed"])
+print(stats["moved"], stats["duplicates"])
+
+undo("~/.local/state/fileflow/last-run.jsonl")
 ```
 
-`on_event` gets human-readable lines, `on_progress` gets `(done, total)`, and
-`stop_event=threading.Event()` cancels a run.
+`stop_event=threading.Event()` cancels either call.
 
 ## Tests
 
@@ -110,9 +126,10 @@ print(stats["moved"], stats["failed"])
 python3 -m unittest discover -s tests -v
 ```
 
-15 tests covering collisions (including 25 files with the same name), idempotency,
-project moves, keep-tree stability, stop behaviour, dry-run, min-size skips,
-per-file logs and the logs classification fix.
+25 tests: collisions (including 25 identical names), idempotency, project moves,
+keep-tree stability, stop before/while running, dry-run, min-size, per-file logs,
+logs classification, undo (restore / copy removal / no overwrite / dry-run),
+exclusions, date grouping, pruning and duplicate detection.
 
 Headless GUI check:
 
@@ -123,8 +140,9 @@ QT_QPA_PLATFORM=offscreen python3 fileflow_qt.py --smoke
 ## Layout
 
 ```
-file_organizer.py    # library + CLI (classification, planner, allocator, runner)
+file_organizer.py    # library + CLI (classify, plan, allocate, run, undo)
 fileflow_qt.py       # PySide6 GUI
+ui_theme.py          # Omarchy theme reader -> palette + QSS
 tests/               # unittest suite
 run.sh               # GUI launcher
 fileflow.desktop     # app launcher entry
@@ -133,10 +151,9 @@ icons/fileflow.svg
 
 ## Notes
 
-- Files are moved with `shutil.move`; cross-device moves fall back to copy+delete,
-  which is the standard behaviour.
-- Symlinks are moved/copied as links, not followed.
-- `.gitignore` excludes `__pycache__`, logs and the local report folder.
+- Moves use `shutil.move`; cross-device moves fall back to copy+delete.
+- Symlinks are moved/copied as links, never followed.
+- The journal is overwritten by each run, so Undo always refers to the last one.
 
 ## Licence
 

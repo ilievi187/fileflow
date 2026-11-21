@@ -24,6 +24,7 @@ CLI:
 """
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import os
@@ -93,6 +94,7 @@ LOG_NAME_HINTS = (
 )
 
 PROJECTS_DIR = "Projects"
+DUPLICATES_DIR = "Duplicates"
 
 
 def classify(name: str) -> str:
@@ -151,6 +153,8 @@ class Stats:
     failed: int = 0
     skipped_size: int = 0
     skipped_sorted: int = 0
+    duplicates: int = 0
+    pruned_dirs: int = 0
     stopped: bool = False
     by_category: dict = field(default_factory=dict)
     by_project: dict = field(default_factory=dict)
@@ -164,6 +168,8 @@ class Stats:
             "failed": self.failed,
             "skipped_size": self.skipped_size,
             "skipped_sorted": self.skipped_sorted,
+            "duplicates": self.duplicates,
+            "pruned_dirs": self.pruned_dirs,
             "stopped": self.stopped,
             "by_category": dict(sorted(self.by_category.items())),
             "by_project": dict(sorted(self.by_project.items())),
@@ -206,9 +212,94 @@ def _target_base(task: Task) -> Path:
     return task.target_base
 
 
+def default_journal_path() -> Path:
+    base = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "fileflow"
+    base.mkdir(parents=True, exist_ok=True)
+    return base / "last-run.jsonl"
+
+
+def compile_excludes(patterns) -> list[str]:
+    if not patterns:
+        return []
+    if isinstance(patterns, str):
+        patterns = [p.strip() for p in patterns.split(",")]
+    return [p for p in (str(p).strip() for p in patterns) if p]
+
+
+def is_excluded(name: str, rel: Path, patterns: list[str]) -> bool:
+    if not patterns:
+        return False
+    posix = rel.as_posix()
+    return any(fnmatch.fnmatch(name, pat) or fnmatch.fnmatch(posix, pat)
+               or any(fnmatch.fnmatch(part, pat) for part in rel.parts)
+               for pat in patterns)
+
+
+def hash_file(path: Path, chunk: int = 1 << 20) -> str | None:
+    digest = hashlib.blake2b(digest_size=16)
+    try:
+        with path.open("rb") as handle:
+            while True:
+                block = handle.read(chunk)
+                if not block:
+                    break
+                digest.update(block)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def find_duplicates(paths: list[Path], stop_event=None) -> dict[str, list[Path]]:
+    """Group identical files by (size, hash). Returns hash -> paths for groups >1."""
+    by_size: dict[int, list[Path]] = {}
+    for path in paths:
+        if stop_event is not None and stop_event.is_set():
+            break
+        try:
+            by_size.setdefault(path.stat().st_size, []).append(path)
+        except OSError:
+            continue
+
+    groups: dict[str, list[Path]] = {}
+    for size, candidates in by_size.items():
+        if len(candidates) < 2:
+            continue
+        for path in candidates:
+            if stop_event is not None and stop_event.is_set():
+                break
+            digest = hash_file(path)
+            if digest:
+                groups.setdefault(f"{size}:{digest}", []).append(path)
+    return {key: value for key, value in groups.items() if len(value) > 1}
+
+
+def prune_empty_dirs(root: Path, keep: Path | None = None) -> int:
+    """Remove empty directories under root (bottom-up). Returns how many."""
+    root = Path(root)
+    removed = 0
+    for current, _dirs, _files in os.walk(root, topdown=False):
+        path = Path(current)
+        if path == root:
+            continue
+        if keep is not None and (path == keep or path.is_relative_to(keep)):
+            continue
+        try:
+            if not any(path.iterdir()):
+                path.rmdir()
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 def plan_task(path: Path, rel: Path, dest: Path, *, shard: bool, keep_tree: bool,
-              project_names, project_regex) -> Task:
+              project_names, project_regex, by_date: bool = False,
+              mtime: float | None = None, duplicate: bool = False) -> Task:
     name = path.name
+    if duplicate:
+        return Task(src=path, rel=rel, category=DUPLICATES_DIR, project=None,
+                    target_base=dest / DUPLICATES_DIR)
+
     category = classify(name)
     project = detect_project(rel.parts, project_names, project_regex)
 
@@ -216,6 +307,10 @@ def plan_task(path: Path, rel: Path, dest: Path, *, shard: bool, keep_tree: bool
         base = dest / PROJECTS_DIR / project
     else:
         base = dest / category
+
+    if by_date and not project:
+        moment = time.localtime(mtime if mtime else path.stat().st_mtime)
+        base = base / time.strftime("%Y", moment) / time.strftime("%m", moment)
 
     if keep_tree:
         parts = list(rel.parent.parts)
@@ -225,7 +320,7 @@ def plan_task(path: Path, rel: Path, dest: Path, *, shard: bool, keep_tree: bool
             parts = parts[1:]
         if parts:
             base = base.joinpath(*parts)
-    elif shard and not project:
+    elif shard and not project and not by_date:
         base = base / shard_key(name)
     return Task(src=path, rel=rel, category=category, project=project, target_base=base)
 
@@ -233,7 +328,8 @@ def plan_task(path: Path, rel: Path, dest: Path, *, shard: bool, keep_tree: bool
 def organize(source, dest=None, *, dry_run=False, copy=False, max_workers=8,
              on_event=None, stop_event=None, project_names=None,
              project_regex=None, shard=True, keep_tree=False, min_size=0,
-             per_file_log=None, on_progress=None):
+             per_file_log=None, on_progress=None, exclude=None, by_date=False,
+             prune_empty=False, duplicates="keep", journal_path=None):
     """Organize `source` into `dest` (defaults to in-place).
 
     Returns a stats dict. `on_event(line)` receives progress text; `on_progress`
@@ -255,6 +351,20 @@ def organize(source, dest=None, *, dry_run=False, copy=False, max_workers=8,
             on_event(line)
 
     log_lock = threading.Lock()
+    excludes = compile_excludes(exclude)
+    journal_handle = None
+    if journal_path:
+        journal_path = Path(journal_path).expanduser()
+        journal_path.parent.mkdir(parents=True, exist_ok=True)
+        journal_handle = journal_path.open("w", encoding="utf-8")
+
+    def journal_entry(src: Path, dst: Path, action: str) -> None:
+        if journal_handle is None:
+            return
+        with log_lock:
+            journal_handle.write(json.dumps(
+                {"src": str(src), "dst": str(dst), "action": action},
+                ensure_ascii=False) + "\n")
 
     def log_entry(entry: dict) -> None:
         if per_file_log is None:
@@ -276,10 +386,23 @@ def organize(source, dest=None, *, dry_run=False, copy=False, max_workers=8,
             continue
         for name in names:
             path = root_path / name
-            files.append((path, path.relative_to(source)))
+            rel = path.relative_to(source)
+            if is_excluded(name, rel, excludes):
+                continue
+            files.append((path, rel))
 
     stats = Stats(total=len(files))
     emit(f"Found {len(files):,} files")
+
+    duplicate_paths: set[Path] = set()
+    if duplicates != "keep" and files:
+        emit("Hashing for duplicates …")
+        groups = find_duplicates([path for path, _rel in files], stop_event)
+        for group in groups.values():
+            for extra in sorted(group, key=str)[1:]:
+                duplicate_paths.add(extra)
+        stats.duplicates = len(duplicate_paths)
+        emit(f"Duplicate files: {len(duplicate_paths):,}")
 
     allocator = Allocator()
     executor = ThreadPoolExecutor(max_workers=max(1, int(max_workers)))
@@ -342,6 +465,9 @@ def organize(source, dest=None, *, dry_run=False, copy=False, max_workers=8,
         elif kind == "stopped":
             stats.stopped = True
 
+        if kind in ("move", "copy"):
+            journal_entry(task.src, target, kind)
+
         if kind != "stopped":
             log_entry({
                 "src": str(task.src),
@@ -363,8 +489,14 @@ def organize(source, dest=None, *, dry_run=False, copy=False, max_workers=8,
         for path, rel in files:
             if stop_event.is_set():
                 break
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                mtime = None
             task = plan_task(path, rel, dest, shard=shard, keep_tree=keep_tree,
-                             project_names=project_names, project_regex=project_regex)
+                             project_names=project_names, project_regex=project_regex,
+                             by_date=by_date, mtime=mtime,
+                             duplicate=(duplicates == "move" and path in duplicate_paths))
             futures.append(executor.submit(do, task))
 
         counted = set()
@@ -392,12 +524,108 @@ def organize(source, dest=None, *, dry_run=False, copy=False, max_workers=8,
         if stop_event.is_set():
             stats.stopped = True
         executor.shutdown(wait=True, cancel_futures=True)
+        if journal_handle is not None:
+            journal_handle.close()
+
+    if prune_empty and not dry_run:
+        kept = dest if dest != source and dest.is_relative_to(source) else None
+        stats.pruned_dirs = prune_empty_dirs(source, keep=kept)
+        if stats.pruned_dirs:
+            emit(f"Removed {stats.pruned_dirs:,} empty folders")
 
     duration = round(time.monotonic() - started, 2)
     emit(f"Done in {duration}s — moved {stats.moved}, copied {stats.copied}, "
          f"already sorted {stats.skipped_sorted}, failed {stats.failed}")
     return stats.as_dict(source=str(source), dest=str(dest), dry_run=dry_run,
                          copy=copy, duration=duration)
+
+
+def undo(journal_path, *, dry_run=False, on_event=None, stop_event=None,
+         prune=True) -> dict:
+    """Reverse a sorted run from its journal: moved files go back, copies are
+    removed. Never overwrites: if the original path is occupied, the file is
+    left where it is and counted as skipped."""
+    journal_path = Path(journal_path).expanduser()
+    if not journal_path.is_file():
+        raise ValueError(f"no journal at {journal_path}")
+
+    def emit(line: str) -> None:
+        if on_event:
+            on_event(line)
+
+    entries = []
+    with journal_path.open(encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    stats = {"total": len(entries), "restored": 0, "removed": 0,
+             "skipped": 0, "failed": 0, "stopped": False, "errors": [],
+             "dry_run": dry_run, "journal": str(journal_path)}
+    touched_dirs: set[Path] = set()
+
+    for entry in reversed(entries):
+        if stop_event is not None and stop_event.is_set():
+            stats["stopped"] = True
+            break
+        action = entry.get("action")
+        src = Path(entry.get("src", ""))
+        dst = Path(entry.get("dst", ""))
+        if not entry.get("dst") or action not in ("move", "copy"):
+            stats["skipped"] += 1
+            continue
+
+        if action == "move":
+            if not dst.exists():
+                stats["skipped"] += 1
+                continue
+            if src.exists():
+                stats["skipped"] += 1          # never clobber something new
+                continue
+            if dry_run:
+                stats["restored"] += 1
+                continue
+            try:
+                src.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(dst), str(src))
+                stats["restored"] += 1
+                touched_dirs.add(dst.parent)
+            except Exception as exc:
+                stats["failed"] += 1
+                if len(stats["errors"]) < 20:
+                    stats["errors"].append(f"{dst}: {exc}")
+        elif action == "copy":
+            if not dst.exists():
+                stats["skipped"] += 1
+                continue
+            if dry_run:
+                stats["removed"] += 1
+                continue
+            try:
+                dst.unlink()
+                stats["removed"] += 1
+                touched_dirs.add(dst.parent)
+            except OSError as exc:
+                stats["failed"] += 1
+                if len(stats["errors"]) < 20:
+                    stats["errors"].append(f"{dst}: {exc}")
+
+        done = stats["restored"] + stats["removed"] + stats["skipped"] + stats["failed"]
+        if done % 200 == 0:
+            emit(f"Restoring… {done:,} / {len(entries):,}")
+
+    if prune and not dry_run:
+        for directory in sorted(touched_dirs, key=lambda item: len(item.parts), reverse=True):
+            prune_empty_dirs(directory)
+
+    emit(f"Undo: restored {stats['restored']}, removed {stats['removed']}, "
+         f"skipped {stats['skipped']}, failed {stats['failed']}")
+    return stats
 
 
 def summarize(stats: dict) -> str:
@@ -429,7 +657,14 @@ def summarize(stats: dict) -> str:
 def _main() -> int:
     parser = argparse.ArgumentParser(
         description="Sort a messy folder into clean, categorized folders.")
-    parser.add_argument("source", help="folder full of mixed files to organize")
+    parser.add_argument("source", nargs="?",
+                        help="folder full of mixed files to organize")
+    parser.add_argument("--undo", action="store_true",
+                        help="undo the run recorded in the journal")
+    parser.add_argument("--journal", default=None,
+                        help="journal path (default: user state dir)")
+    parser.add_argument("--no-journal", action="store_true",
+                        help="do not write a journal (disables undo)")
     parser.add_argument("--dest", default=None,
                         help="destination folder (default: in-place)")
     parser.add_argument("--copy", action="store_true", help="copy instead of move")
@@ -449,7 +684,30 @@ def _main() -> int:
     parser.add_argument("--log", default=None,
                         help="write a JSONL per-file log (src, dst, action) here")
     parser.add_argument("--json-out", default=None, help="write the stats JSON here")
+    parser.add_argument("--exclude", default=None,
+                        help="comma-separated globs to ignore (e.g. '*.tmp,node_modules')")
+    parser.add_argument("--by-date", action="store_true",
+                        help="group inside each category by YYYY/MM")
+    parser.add_argument("--prune-empty", action="store_true",
+                        help="remove folders left empty after the run")
+    parser.add_argument("--duplicates", choices=("keep", "move", "report"),
+                        default="keep",
+                        help="keep duplicates, move them to Duplicates/, or just report")
     args = parser.parse_args()
+
+    journal = None if args.no_journal else Path(args.journal or default_journal_path())
+
+    if args.undo:
+        stats = undo(journal or default_journal_path(), dry_run=args.dry_run,
+                     on_event=lambda line: print(line, flush=True))
+        print(f"restored {stats['restored']:,} | removed {stats['removed']:,} | "
+              f"skipped {stats['skipped']:,} | failed {stats['failed']:,}")
+        if args.json_out:
+            Path(args.json_out).write_text(json.dumps(stats, indent=2), encoding="utf-8")
+        return 0
+
+    if not args.source:
+        parser.error("a source folder is required (or use --undo)")
 
     log_handle = open(args.log, "w", encoding="utf-8") if args.log else None
     try:
@@ -460,6 +718,9 @@ def _main() -> int:
             keep_tree=args.keep_tree, min_size=args.min_size_bytes,
             on_event=lambda line: print(line, flush=True),
             per_file_log=log_handle,
+            exclude=args.exclude, by_date=args.by_date,
+            prune_empty=args.prune_empty, duplicates=args.duplicates,
+            journal_path=journal,
         )
     finally:
         if log_handle:

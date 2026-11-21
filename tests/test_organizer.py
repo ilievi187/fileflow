@@ -1,12 +1,13 @@
 """Tests for file_organizer — every case below used to fail or was untested."""
 
 import json
+import os
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 
-from file_organizer import classify, organize
+from file_organizer import classify, find_duplicates, organize, undo
 
 
 def make(root: Path, files: dict[str, str]) -> None:
@@ -173,6 +174,120 @@ class MiscTests(unittest.TestCase):
             self.assertEqual(len(entries), 1)
             self.assertEqual(entries[0]["action"], "move")
             self.assertTrue(entries[0]["dst"].endswith("a.pdf"))
+
+
+class UndoTests(unittest.TestCase):
+    def _run(self, tmp: Path, **kwargs):
+        src = tmp / "src"
+        make(src, {"a.pdf": "one", "sub/b.jpg": "two", "c.py": "three"})
+        journal = tmp / "journal.jsonl"
+        organize(src, dest=tmp / "out", journal_path=journal, **kwargs)
+        return src, journal
+
+    def test_undo_restores_moved_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            src, journal = self._run(tmp_path)
+            self.assertEqual(len(tree(tmp_path / "out")), 3)
+
+            stats = undo(journal)
+            self.assertEqual(stats["restored"], 3)
+            self.assertEqual(stats["failed"], 0)
+            self.assertEqual(sorted(tree(src)), ["a.pdf", "c.py", "sub/b.jpg"])
+
+    def test_undo_of_copy_removes_copies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            src, journal = self._run(tmp_path, copy=True)
+            stats = undo(journal)
+            self.assertEqual(stats["removed"], 3)
+            self.assertEqual(len(tree(src)), 3)
+            self.assertEqual(len(tree(tmp_path / "out")), 0)
+
+    def test_undo_never_overwrites(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            src, journal = self._run(tmp_path)
+            (src / "a.pdf").write_text("a new file with the same name")
+            stats = undo(journal)
+            self.assertEqual(stats["skipped"], 1)
+            self.assertEqual((src / "a.pdf").read_text(), "a new file with the same name")
+            self.assertTrue(any(p.name == "a.pdf" for p in (tmp_path / "out").rglob("*")))
+
+    def test_undo_dry_run_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            src, journal = self._run(tmp_path)
+            stats = undo(journal, dry_run=True)
+            self.assertEqual(stats["restored"], 3)
+            self.assertEqual(len(tree(tmp_path / "out")), 3)
+            self.assertEqual(len(tree(src)), 0)
+
+
+class ExcludeTests(unittest.TestCase):
+    def test_excluded_files_are_left_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src"
+            make(src, {"keep.pdf": "x", "skip.tmp": "x", "node_modules/x.js": "x"})
+            stats = organize(src, dest=Path(tmp) / "out",
+                             exclude="*.tmp,node_modules")
+            self.assertEqual(stats["total"], 1)
+            self.assertEqual(stats["moved"], 1)
+            self.assertTrue((src / "skip.tmp").exists())
+            self.assertTrue((src / "node_modules" / "x.js").exists())
+
+
+class ByDateTests(unittest.TestCase):
+    def test_year_month_folders(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src"
+            make(src, {"old.pdf": "x"})
+            stamp = 1710460800  # 2024-03-15
+            os.utime(src / "old.pdf", (stamp, stamp))
+            organize(src, dest=Path(tmp) / "out", by_date=True)
+            self.assertTrue((Path(tmp) / "out" / "Documents" / "2024" / "03" / "old.pdf").exists())
+
+
+class PruneTests(unittest.TestCase):
+    def test_empty_folders_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src"
+            make(src, {"sub/deep/a.pdf": "x"})
+            (src / "empty1" / "empty2").mkdir(parents=True)
+            stats = organize(src, dest=Path(tmp) / "out", prune_empty=True)
+            self.assertFalse((src / "sub").exists())
+            self.assertFalse((src / "empty1").exists())
+            self.assertTrue(src.exists())
+            self.assertGreaterEqual(stats["pruned_dirs"], 3)
+
+
+class DuplicateTests(unittest.TestCase):
+    def test_find_duplicates_groups_by_content(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src"
+            make(src, {"a/report.pdf": "same", "b/report.pdf": "same",
+                       "c/other.pdf": "different"})
+            groups = find_duplicates([p for p in src.rglob("*") if p.is_file()])
+            self.assertEqual(len(groups), 1)
+            self.assertEqual(len(next(iter(groups.values()))), 2)
+
+    def test_move_duplicates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src"
+            make(src, {"a/report.pdf": "same", "b/report.pdf": "same"})
+            stats = organize(src, dest=Path(tmp) / "out", duplicates="move")
+            out = Path(tmp) / "out"
+            self.assertEqual(stats["duplicates"], 1)
+            self.assertTrue((out / "Duplicates" / "report.pdf").exists())
+            self.assertTrue((out / "Documents" / "R" / "report.pdf").exists())
+
+    def test_report_only_keeps_everything_sorted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src"
+            make(src, {"a/report.pdf": "same", "b/report.pdf": "same"})
+            stats = organize(src, dest=Path(tmp) / "out", duplicates="report")
+            self.assertEqual(stats["duplicates"], 1)
+            self.assertFalse((Path(tmp) / "out" / "Duplicates").exists())
 
 
 if __name__ == "__main__":
