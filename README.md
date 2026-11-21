@@ -1,19 +1,33 @@
 # FileFlow
 
-Sort a messy folder into clean, categorized folders — a small **library + CLI + tkinter GUI** for tidying up downloads, scans, and dumps.
+Sort a messy folder into clean, categorized folders — a small **library + CLI + Qt GUI**
+for tidying downloads, screenshots, scans and dumps.
 
-FileFlow classifies files by extension, name hints, and project rules, shuffles them into category folders (optionally split by first letter for huge folders), handles filename collisions by adding a short digest suffix, and reports a JSON stats summary.
+![FileFlow](docs/screenshot.png)
 
-> Drop it in a folder of 100,000+ files and it sorts them into sensible subfolders — no manual dragging.
+Drop a folder on the window, press Start, watch it sort. Nothing leaves your
+machine.
 
-## Features
+## What it does
 
-- **Auto-categorization** by extension + name hints (Documents, Images, Videos, Audio, Code, Data, Logs, Fonts, Archives, Other…).
-- **Projects** — pull out your own projects by name or a regex.
-- **Sharding** — split a category into folders by first letter so no single folder gets 1,000,000 files.
-- **Collision-safe** — duplicate filenames get a `name_digest.ext` suffix instead of being overwritten.
-- **Copy or move**, **dry-run**, preserve subfolders, configurable worker threads.
-- **Library + CLI + GUI**: import as a module, use from the command line, or run the packaged tkinter GUI with live log.
+- **Categorises** by extension and name hints: Documents, Images, Videos, Audio,
+  Archives, Code, Data, Fonts, Executables, Logs, Other.
+- **Projects** — pull out your own projects by name or regex into `Projects/<name>/`.
+- **Sharding** — split big categories into `A/`, `B/`, `C/` so no folder ends up
+  with a million files.
+- **Keeps the tree** optionally, so `sub/deep/file.pdf` stays under
+  `Documents/sub/deep/`.
+- **Copy or move**, **dry-run**, minimum file size, configurable workers.
+
+## Guarantees (all covered by tests)
+
+| Guarantee | Why it matters |
+|---|---|
+| **Nothing is overwritten** | destinations are allocated under a lock; a collision becomes `name_ab12cd34.pdf`, never a silent replace |
+| **Running twice is safe** | a file already at its computed destination counts as "already sorted" and is left alone — no digest suffixes piling up |
+| **Stop actually stops** | `stop_event` is checked before queueing and inside every task; in-flight tasks are still counted so the numbers match the disk |
+| **No shell** | nothing is ever passed through a shell |
+| **Your output isn't re-scanned** | if `--dest` is inside the source, that subtree is skipped |
 
 ## Install
 
@@ -22,82 +36,108 @@ git clone https://github.com/ilievi187/fileflow.git
 cd fileflow
 ```
 
-No third-party dependencies — just Python 3.8+ and (for the GUI) `python3-tk`.
+- Python 3.9+
+- GUI only: `pyside6` (`sudo pacman -S pyside6`)
 
-## CLI usage
+## GUI
 
 ```bash
-# Just preview the plan (nothing moves)
-python3 file_organizer.py /path/to/messy --dry-run
-
-# Actually sort into a clean folder
-python3 file_organizer.py /path/to/messy --dest /path/clean \
-  --projects mysite,projectX --project-regex 'report_|_backup' \
-  --max-workers 8
+./run.sh            # or: python3 fileflow_qt.py
 ```
 
-Common flags:
+- drop a folder anywhere on the window (or click the box)
+- destination is optional — empty means sort in place
+- live progress bar, counters for moved / copied / already sorted / failed
+- Stop button, `Ctrl+Enter` to start, `Esc` to stop
+- "open destination" when it finishes
+- `fileflow.desktop` + `icons/fileflow.svg` for your app launcher
 
-| flag | what it does |
-|------|--------------|
-| `--dest DEST` | destination folder (default: in-place) |
+## CLI
+
+```bash
+# preview only
+python3 file_organizer.py ~/Downloads --dry-run
+
+# sort into a separate tree, pull out two projects
+python3 file_organizer.py ~/messy --dest ~/sorted \
+    --projects siteA,projectX --project-regex 'report_|_backup' --max-workers 8
+
+# copy instead of move, keep subfolders
+python3 file_organizer.py ~/messy --copy --keep-tree
+
+# per-file JSONL log + stats JSON
+python3 file_organizer.py ~/messy --log run.jsonl --json-out stats.json
+```
+
+| Flag | Meaning |
+|---|---|
+| `--dest DIR` | destination (default: in place) |
 | `--copy` | copy instead of move |
-| `--max-workers N` | worker threads |
-| `--dry-run` | show the plan without moving anything |
-| `--no-shard` | put everything in one folder per category |
-| `--keep-tree` | preserve relative subfolder structure |
-| `--projects NAME` | comma-separated project names to sort out |
-| `--project-regex RX` | regex that marks a file as a project match |
-| `--min-size-bytes N` | skip files smaller than N bytes |
-| `--log LOG` | write a per-file log to this path |
-| `--json-out JSON` | write stats JSON to this path |
+| `--dry-run` | plan only |
+| `--no-shard` | one folder per category |
+| `--keep-tree` | keep source subfolders inside each category |
+| `--projects a,b` | project names to pull into `Projects/` |
+| `--project-regex RE` | regex alternative |
+| `--min-size-bytes N` | skip small files |
+| `--max-workers N` | worker threads (default 8) |
+| `--log FILE` | JSONL per-file log (`src`, `dst`, `action`) |
+| `--json-out FILE` | stats JSON |
 
-## Library usage
+## Library
 
 ```python
 from file_organizer import organize
-from threading import Event
 
 stats = organize(
-    "/path/to/messy",
-    dest="/path/clean",
-    on_event=print,
-    stop_event=Event(),
+    "~/messy",
+    dest="~/sorted",
+    copy=False,
+    projects=None,
+    project_names="siteA",
+    keep_tree=False,
+    on_event=print,               # progress text
+    on_progress=lambda done, total: ...,  # progress bar
 )
-print(stats)
+print(stats["moved"], stats["failed"])
 ```
 
-## GUI usage
+`on_event` gets human-readable lines, `on_progress` gets `(done, total)`, and
+`stop_event=threading.Event()` cancels a run.
+
+## Tests
 
 ```bash
-python3 file_organizer_gui.py
+python3 -m unittest discover -s tests -v
 ```
 
-A themed tkinter window with fields for source/dest, options (Copy, Shard, Preserve subfolders, Dry-run, Projects), a live log pane, and a Stop button.
+15 tests covering collisions (including 25 files with the same name), idempotency,
+project moves, keep-tree stability, stop behaviour, dry-run, min-size skips,
+per-file logs and the logs classification fix.
 
-## Example
+Headless GUI check:
 
-```
-$ python3 file_organizer.py ~/Downloads --dest ~/Library --projects mysite,projectX --project-regex 'report_|_backup'
-
-Source : /home/user/Downloads
-Dest   : /home/user/Library
-Total  : 108
-Moved  : 108  (copied=0)
-Failed : 0
-Projects: _backup(1), mysite(1), projectX(1), report_(2)
-By category:
-  Documents              25
-  Images                 13
-  ...
+```bash
+QT_QPA_PLATFORM=offscreen python3 fileflow_qt.py --smoke
 ```
 
-## License
+## Layout
 
-Released under the [MIT License](LICENSE) — free to use, copy, and modify.
+```
+file_organizer.py    # library + CLI (classification, planner, allocator, runner)
+fileflow_qt.py       # PySide6 GUI
+tests/               # unittest suite
+run.sh               # GUI launcher
+fileflow.desktop     # app launcher entry
+icons/fileflow.svg
+```
 
----
+## Notes
 
-Enjoy! If it saved you time, [buy me a coffee]([RENDER_BMO_LINK]) ☕
+- Files are moved with `shutil.move`; cross-device moves fall back to copy+delete,
+  which is the standard behaviour.
+- Symlinks are moved/copied as links, not followed.
+- `.gitignore` excludes `__pycache__`, logs and the local report folder.
 
-[buy me a coffee]: https://buymeacoffee.com/aurorauap
+## Licence
+
+MIT — see [LICENSE](LICENSE).

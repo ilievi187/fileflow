@@ -1,8 +1,9 @@
 [Desktop Entry]
+Type=Application
 Name=FileFlow
-Comment=Sort a messy folder into categorized, sharded folders (library + CLI + tkinter GUI)
-Exec=python3 /home/iliev/fileflow/file_organizer_gui.py
+Comment=Sort a messy folder into clean, categorized folders
+Exec=/home/iliev/fileflow/run.sh
 Icon=/home/iliev/fileflow/icons/fileflow.svg
 Terminal=false
-Type=Application
 Categories=Utility;FileTools;
+Keywords=organizer;sorter;files;cleanup;fileflow;
