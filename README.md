@@ -40,6 +40,12 @@ cd fileflow
 - Python 3.9+
 - GUI only: `pyside6` (`sudo pacman -S pyside6`)
 
+Register the app launcher entry:
+
+```bash
+./install.sh
+```
+
 ## GUI
 
 ```bash
@@ -145,7 +151,8 @@ fileflow_qt.py       # PySide6 GUI
 ui_theme.py          # Omarchy theme reader -> palette + QSS
 tests/               # unittest suite
 run.sh               # GUI launcher
-fileflow.desktop     # app launcher entry
+install.sh           # writes the launcher entry with the right absolute path
+fileflow.desktop     # app launcher entry (template)
 icons/fileflow.svg
 ```
 
