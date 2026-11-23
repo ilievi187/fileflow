@@ -37,7 +37,7 @@ git clone https://github.com/ilievi187/fileflow.git
 cd fileflow
 ```
 
-- Python 3.9+
+- Python 3.11+ (uses standard-library `tomllib`)
 - GUI only: `pyside6` (`sudo pacman -S pyside6`)
 
 Register the app launcher entry:
@@ -127,6 +127,9 @@ undo("~/.local/state/fileflow/last-run.jsonl")
 `stop_event=threading.Event()` cancels either call.
 
 ## Tests
+
+The [GitHub Actions CI workflow](.github/workflows/ci.yml) runs the organizer tests on Python 3.11, 3.12 and 3.13, plus a headless Qt smoke test on Linux. You can run the same checks locally:
+
 
 ```bash
 python3 -m unittest discover -s tests -v
